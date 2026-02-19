@@ -20,6 +20,7 @@ class DADeformMamba(nn.Module):
                  deform_layers: int = 2, deform_heads: int = 8, deform_groups: int = 4, deform_kernel: int = 7,
                  conbimamba_layers: int = 3,
                  dropout: float = 0.1,
+                 require_mamba: bool = False,
                  task_mode: str = "quantile",
                  quantiles = (0.1, 0.5, 0.9),
                  domain_hidden: int = 64):
@@ -46,7 +47,13 @@ class DADeformMamba(nn.Module):
         ])
 
         # Mamba encoder（长依赖编码）
-        self.mamba = ConBiMambaEncoder(d_model=d_model, num_layers=conbimamba_layers, dropout=dropout, conv_kernel=31)
+        self.mamba = ConBiMambaEncoder(
+            d_model=d_model,
+            num_layers=conbimamba_layers,
+            dropout=dropout,
+            conv_kernel=31,
+            require_mamba=require_mamba,
+        )
 
         # pooling：取最后时间步（也可改成 mean pooling）
         self.norm_out = nn.LayerNorm(d_model)

@@ -113,6 +113,7 @@ def run_one_target(cfg, df, target_city: str, device: str):
         deform_kernel=cfg["model"]["deform_kernel"],
         conbimamba_layers=cfg["model"]["conbimamba_layers"],
         dropout=cfg["model"]["dropout"],
+        require_mamba=bool(cfg["model"].get("require_mamba", False)),
         task_mode=task_mode,
         quantiles=quantiles,
         domain_hidden=cfg["domain_adv"]["domain_hidden"],
@@ -131,10 +132,13 @@ def run_one_target(cfg, df, target_city: str, device: str):
     best_val = 1e18
     best_state = None
     global_iter = 0
+    history_rows = []
 
     for epoch in range(1, cfg["train"]["epochs"] + 1):
         model.train()
         pbar = tqdm(tr_loader, desc=f"[{target_city}] epoch {epoch}")
+        epoch_loss, epoch_task, epoch_dom = [], [], []
+        lamb_last = 0.0
         for xb, yb, db in pbar:
             xb = xb.to(device)
             yb = yb.to(device)
@@ -146,6 +150,7 @@ def run_one_target(cfg, df, target_city: str, device: str):
                 continue
 
             lamb = lambda_schedule(global_iter, max_iter=max_iter, gamma=gamma) if cfg["domain_adv"]["enabled"] else 0.0
+            lamb_last = float(lamb)
 
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=scaler_amp.is_enabled()):
@@ -167,10 +172,21 @@ def run_one_target(cfg, df, target_city: str, device: str):
             scaler_amp.update()
 
             global_iter += 1
+            epoch_loss.append(float(loss.item()))
+            epoch_task.append(float(task_loss.item()))
+            epoch_dom.append(float(dom_loss.item()))
             pbar.set_postfix({"loss": float(loss.item()), "task": float(task_loss.item()), "dom": float(dom_loss.item()), "λ": lamb})
 
         # validation (use RMSE on median/point)
         val_rmse = evaluate(model, va_loader, device, task_mode, quantiles)
+        history_rows.append({
+            "epoch": int(epoch),
+            "train_loss_mean": float(np.mean(epoch_loss)) if epoch_loss else np.nan,
+            "train_task_loss_mean": float(np.mean(epoch_task)) if epoch_task else np.nan,
+            "train_dom_loss_mean": float(np.mean(epoch_dom)) if epoch_dom else np.nan,
+            "val_rmse": float(val_rmse),
+            "grl_lambda_last": float(lamb_last),
+        })
         if val_rmse < best_val:
             best_val = val_rmse
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -178,13 +194,14 @@ def run_one_target(cfg, df, target_city: str, device: str):
     # test
     model.load_state_dict(best_state)
     test_metrics, pred_df = test_and_dump(model, te_loader, device, task_mode, quantiles, target_city)
+    history_df = pd.DataFrame(history_rows)
 
     return {
         "target_city": target_city,
         "num_domains": num_domains,
         "best_val_rmse": float(best_val),
         **test_metrics
-    }, pred_df, best_state, scaler, gmm
+    }, pred_df, history_df, best_state, scaler, gmm
 
 @torch.no_grad()
 def evaluate(model, loader, device, task_mode, quantiles):
@@ -294,22 +311,28 @@ def main():
 
     all_metrics = []
     all_pred = []
+    all_history = []
 
     for tcity in targets:
-        metrics, pred_df, best_state, scaler, gmm = run_one_target(cfg, df, tcity, args.device)
+        metrics, pred_df, history_df, best_state, scaler, gmm = run_one_target(cfg, df, tcity, args.device)
         all_metrics.append(metrics)
         all_pred.append(pred_df)
+        history_df = history_df.copy()
+        history_df["target_city"] = tcity
+        all_history.append(history_df)
 
         # save model
         tdir = os.path.join(exp_dir, tcity)
         ensure_dir(tdir)
         torch.save(best_state, os.path.join(tdir, "best.pt"))
         pred_df.to_csv(os.path.join(tdir, "predictions.csv"), index=False)
+        history_df.to_csv(os.path.join(tdir, "history.csv"), index=False)
         save_json(metrics, os.path.join(tdir, "metrics.json"))
 
     # summary
     save_json(all_metrics, os.path.join(exp_dir, "metrics_all.json"))
     pd.concat(all_pred, axis=0).to_csv(os.path.join(exp_dir, "predictions_all.csv"), index=False)
+    pd.concat(all_history, axis=0).to_csv(os.path.join(exp_dir, "history_all.csv"), index=False)
     print("Done. Results saved to:", exp_dir)
 
 if __name__ == "__main__":

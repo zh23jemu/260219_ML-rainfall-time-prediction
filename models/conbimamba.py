@@ -25,8 +25,20 @@ class _MambaFallback(nn.Module):
 
 class ExBiMamba(nn.Module):
     """外部双向 Mamba：正向 + 反向，拼接后线性投影回 d_model。"""
-    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        require_mamba: bool = False,
+    ):
         super().__init__()
+        if require_mamba and (not MAMBA_AVAILABLE):
+            raise RuntimeError(
+                "require_mamba=True but mamba_ssm is not available. "
+                "Install mamba-ssm in a CUDA-enabled Linux environment."
+            )
         if MAMBA_AVAILABLE:
             self.forward_mamba = _Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
             self.backward_mamba = _Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
@@ -86,10 +98,16 @@ class ConBiMambaBlock(nn.Module):
     """
     结构：FFN(1/2) -> ExBiMamba -> Conv -> FFN(1/2) + LN
     """
-    def __init__(self, d_model: int, dropout: float = 0.1, conv_kernel: int = 31):
+    def __init__(
+        self,
+        d_model: int,
+        dropout: float = 0.1,
+        conv_kernel: int = 31,
+        require_mamba: bool = False,
+    ):
         super().__init__()
         self.ff1 = FeedForward(d_model, expansion=4, dropout=dropout)
-        self.mamba = ExBiMamba(d_model)
+        self.mamba = ExBiMamba(d_model, require_mamba=require_mamba)
         self.conv = ConformerConv(d_model, kernel_size=conv_kernel, dropout=dropout)
         self.ff2 = FeedForward(d_model, expansion=4, dropout=dropout)
         self.norm = nn.LayerNorm(d_model)
@@ -102,10 +120,22 @@ class ConBiMambaBlock(nn.Module):
         return self.norm(x)
 
 class ConBiMambaEncoder(nn.Module):
-    def __init__(self, d_model: int, num_layers: int = 3, dropout: float = 0.1, conv_kernel: int = 31):
+    def __init__(
+        self,
+        d_model: int,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+        conv_kernel: int = 31,
+        require_mamba: bool = False,
+    ):
         super().__init__()
         self.layers = nn.ModuleList([
-            ConBiMambaBlock(d_model=d_model, dropout=dropout, conv_kernel=conv_kernel)
+            ConBiMambaBlock(
+                d_model=d_model,
+                dropout=dropout,
+                conv_kernel=conv_kernel,
+                require_mamba=require_mamba,
+            )
             for _ in range(num_layers)
         ])
 
