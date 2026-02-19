@@ -284,6 +284,11 @@ def main():
     city_cols = [c for c in df.columns if c not in ["date", "doy_sin", "doy_cos"]]
     if target == "__all__":
         targets = city_cols
+    elif isinstance(target, list):
+        missing = [c for c in target if c not in city_cols]
+        if missing:
+            raise ValueError(f"target_city list contains unknown cities: {missing}")
+        targets = list(target)
     else:
         targets = [target]
 

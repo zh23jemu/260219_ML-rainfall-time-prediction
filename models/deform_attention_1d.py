@@ -93,13 +93,14 @@ class DeformAtten1D(nn.Module):
         # add offset
         sample_pos = pos + offset  # (Bg,1,L)
         # normalize: [-1,1]
-        sample_grid = 2.0 * (sample_pos / max(L - 1, 1)) - 1.0  # (Bg,1,L)
-        sample_grid = sample_grid.permute(0, 2, 1).unsqueeze(2)  # (Bg,L,1,1)
+        sample_grid_t = 2.0 * (sample_pos / max(L - 1, 1)) - 1.0  # (Bg,1,L)
+        sample_grid_t = sample_grid_t.permute(0, 2, 1).unsqueeze(2)  # (Bg,L,1,1)
+        # grid_sample for 4D input expects grid[...,2] => (x, y).
+        sample_grid_x = torch.zeros_like(sample_grid_t)
+        sample_grid = torch.cat([sample_grid_x, sample_grid_t], dim=-1)  # (Bg,L,1,2)
 
         # sample k,v in grouped manner
-        x_grouped = rearrange(x_c, "b (g c) l -> (b g) c l", g=self.n_groups)  # (Bg,Cg,L)
         # grid_sample expects 4D: (N,C,H,W). here treat (L,1) as (H,W)
-        x_grouped_4d = x_grouped.unsqueeze(-1)  # (Bg,Cg,L,1)
         k_grouped = rearrange(k, "b (g c) l -> (b g) c l", g=self.n_groups).unsqueeze(-1)
         v_grouped = rearrange(v, "b (g c) l -> (b g) c l", g=self.n_groups).unsqueeze(-1)
 

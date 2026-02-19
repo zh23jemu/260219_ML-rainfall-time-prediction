@@ -65,8 +65,8 @@ class ConformerConv(nn.Module):
         super().__init__()
         inner = d_model * expansion
         pad = kernel_size // 2
+        self.pre_norm = nn.LayerNorm(d_model)
         self.net = nn.Sequential(
-            nn.LayerNorm(d_model),
             nn.Conv1d(d_model, inner, kernel_size=1),
             nn.GLU(dim=1),                                 # halves channels
             nn.Conv1d(inner // 2, inner // 2, kernel_size=kernel_size, padding=pad, groups=inner // 2),
@@ -78,7 +78,7 @@ class ConformerConv(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # (B,T,C)->(B,C,T)->conv->(B,C,T)->(B,T,C)
-        y = x.transpose(1, 2)
+        y = self.pre_norm(x).transpose(1, 2)
         y = self.net(y)
         return y.transpose(1, 2)
 

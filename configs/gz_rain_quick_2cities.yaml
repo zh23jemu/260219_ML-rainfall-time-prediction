@@ -1,0 +1,54 @@
+exp_name: gz_rain_da_deformmamba_2cities
+data_path: 20152024.xlsx
+
+# 支持字符串("__all__"/单城市)或城市列表
+target_city: ["贵阳市", "遵义市"]
+
+# 输入构造
+lookback_L: 90
+horizon_H: 7
+use_time_features: true
+neighbor_mode: "all"
+topk: 6
+
+split:
+  train_years: [2015,2016,2017,2018,2019,2020,2021]
+  val_years:   [2022]
+  test_years:  [2023,2024]
+
+gmm:
+  k_min: 2
+  k_max: 6
+  random_state: 42
+
+model:
+  d_model: 128
+  deform_layers: 2
+  deform_heads: 8
+  deform_groups: 4
+  deform_kernel: 7
+  conbimamba_layers: 3
+  dropout: 0.1
+
+train:
+  seed: 42
+  batch_size: 64
+  num_workers: 0
+  lr: 0.0008
+  weight_decay: 0.0001
+  epochs: 8
+  grad_clip: 1.0
+  use_amp: true
+
+domain_adv:
+  enabled: true
+  beta: 0.2
+  grl_gamma: 10.0
+  max_iter: 20000
+  domain_hidden: 64
+
+task:
+  mode: "quantile"
+  quantiles: [0.1, 0.5, 0.9]
+  use_huber_pinball: true
+  huber_delta: 1.0
