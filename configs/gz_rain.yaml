@@ -1,0 +1,60 @@
+exp_name: gz_rain_da_deformmamba
+data_path: data/2015-2024贵州降水数据(1).xlsx
+
+# 目标城市：填具体列名，例如 "贵阳市"；填 "__all__" 则轮流训练每个城市并汇总
+target_city: "贵阳市"
+
+# 输入构造
+lookback_L: 90
+horizon_H: 7
+use_time_features: true          # 加入 day-of-year 的 sin/cos
+neighbor_mode: "all"             # all | topk_corr
+topk: 6                          # neighbor_mode=topk_corr 时生效
+
+# 训练/验证/测试按年份划分（可改成你想要的跨域设置）
+split:
+  train_years: [2015,2016,2017,2018,2019,2020,2021]
+  val_years:   [2022]
+  test_years:  [2023,2024]
+
+# GMM 子域
+gmm:
+  k_min: 2
+  k_max: 6
+  random_state: 42
+
+# 模型
+model:
+  d_model: 128
+  deform_layers: 2
+  deform_heads: 8
+  deform_groups: 4
+  deform_kernel: 7
+  conbimamba_layers: 3
+  dropout: 0.1
+
+# 训练
+train:
+  seed: 42
+  batch_size: 64
+  num_workers: 0
+  lr: 0.0008
+  weight_decay: 0.0001
+  epochs: 40
+  grad_clip: 1.0
+  use_amp: true
+
+# 域对抗
+domain_adv:
+  enabled: true
+  beta: 0.2               # 总损失 = task + beta * domain
+  grl_gamma: 10.0         # lambda schedule 的 gamma
+  max_iter: 20000         # schedule 上限（近似）
+  domain_hidden: 64
+
+# 任务：point | quantile
+task:
+  mode: "quantile"
+  quantiles: [0.1, 0.5, 0.9]
+  use_huber_pinball: true
+  huber_delta: 1.0
