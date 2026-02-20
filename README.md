@@ -1,69 +1,291 @@
-# DA-DeformMamba for Guizhou Daily Rainfall (2015–2024)
+# DA-DeformMamba 贵州逐日降雨预测（2015-2024）
 
-本仓库提供一套**可直接运行**的端到端代码，实现论文中的 DA-DeformMamba 思路：
-- 多城市（空间）+ 多年逐日（时间）的多变量输入
-- GMM 无监督子域划分（年代/气候模态）
-- Deformable Attention（1D，可学习时间偏移）对齐动态传播滞后
-- (Con)BiMamba 编码器（双向 Mamba；若未安装 mamba-ssm 则自动退化为 GRU 版本）
-- GRL 域对抗（Domain Adversarial）实现域适应/域泛化
-- 点预测（MSE）或分位数预测（Pinball / Huber-Pinball）
+本项目提供一套可直接运行的时空降雨预测流水线，核心能力包括：
+- 多城市多变量输入（空间维）
+- 长时间窗建模（时间维）
+- GMM 无监督子域划分
+- 1D Deformable Attention 时间偏移对齐
+- ConBiMamba 编码（未安装 `mamba-ssm` 时自动回退到 GRU）
+- GRL 域对抗训练
+- 点预测（MSE）与分位数预测（Pinball / Huber-Pinball）
 
-> 说明：你提供的 3_7_Deformable_Attention.py 里包含 1D/2D 版本，但 2D 版本在公开片段中存在维度不一致问题。本实现使用**1D 变形注意力**实现“时间滞后对齐”，空间（多城市）信息通过输入投影与后续编码器融合，训练/推理稳定可复现。
+## 项目结构
 
-## 0. 环境准备
-Python >= 3.9，建议使用 conda/venv。
-
-安装依赖：
-```bash
-pip install -r requirements.txt
+```text
+.
+├─configs/                     # 训练配置
+├─scripts/
+│  ├─train.py                  # 训练与评估主入口
+│  ├─plot_results.py           # 训练曲线/指标图
+│  └─plot_predictions.py       # 预测时序图
+├─models/                      # 模型结构
+├─runs/                        # 训练输出目录
+├─data.py dataset.py ...       # 数据处理与损失/指标
+└─README.md
 ```
 
-若你希望固定当前环境版本（推荐云上训练）：
+## 1. 环境要求
+
+## 1.1 推荐版本
+- OS: Ubuntu 22.04
+- Python: 3.10
+- CUDA: 12.8
+- PyTorch: 2.7.0 (cu128)
+
+## 1.2 快速创建环境（Linux）
+
 ```bash
-pip install -r requirements-lock.txt
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
 ```
 
-若你希望启用真正的 Mamba（而非 GRU 退化版本），请额外安装：
+## 1.3 依赖安装策略
+
+本仓库有两类依赖文件：
+- `requirements.txt`: 通用依赖（跨平台）
+- `requirements-lock.txt`: 某一台机器导出的锁版本（不一定跨平台）
+
+建议：
+1. 先按你的服务器环境安装兼容版本。
+2. 安装成功后执行 `pip freeze > requirements-lock-linux-py310.txt`，形成你自己的锁文件。
+
+## 1.4 PyTorch 安装示例（CUDA 12.8）
+
 ```bash
-pip install mamba-ssm
+pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.7.0
 ```
 
-## 1. 数据准备
-将你的数据文件放到任意路径，例如：
-`data/2015-2024贵州降水数据(1).xlsx`
+## 1.5 其余常用依赖示例（Python 3.10）
 
-表格要求：
-- 第一列为日期（本仓库默认识别为 `Unnamed: 0` 或 `date`）
-- 其余列为城市/州的逐日降雨（数值）
+```bash
+pip install numpy==2.2.6 pandas==2.2.3 scikit-learn==1.6.1 \
+  PyYAML==6.0.2 einops==0.8.1 tqdm==4.67.1 matplotlib==3.9.4 openpyxl==3.1.5
+```
 
-## 2. 训练
+安装后检查：
+
+```bash
+python -c "import torch, numpy, pandas; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(numpy.__version__, pandas.__version__)"
+```
+
+## 2. 数据准备
+
+`configs/gz_rain.yaml` 中的 `data_path` 必须与实际文件路径一致。
+
+示例：
+- 根目录：`20152024.xlsx`
+- 或数据目录：`data/2015-2024贵州降水数据(1).xlsx`
+
+可先检查文件是否存在：
+
+```bash
+ls -lah
+ls -lah data
+```
+
+数据格式要求：
+- 第一列是日期（可被解析为 `date`）
+- 后续列为各城市逐日降水值（数值）
+
+## 3. 训练
+
+## 3.1 标准训练
+
 ```bash
 python scripts/train.py --config configs/gz_rain.yaml
 ```
 
-断点续训（自动读取 `runs/<exp_name>/<target_city>/last.ckpt`）：
+## 3.2 快速验证配置
+
+```bash
+python scripts/train.py --config configs/gz_rain_quick_all.yaml
+```
+
+## 3.3 断点续训
+
+自动从 `runs/<exp_name>/<target_city>/last.ckpt` 继续：
+
 ```bash
 python scripts/train.py --config configs/gz_rain.yaml --resume
 ```
 
-从指定 checkpoint 续训（仅单目标）：
+指定 checkpoint 继续（仅单目标）：
+
 ```bash
 python scripts/train.py --config configs/gz_rain.yaml --resume_path runs/<exp_name>/<target_city>/last.ckpt
 ```
 
-你可以在 `configs/gz_rain.yaml` 中修改：
-- target_city：预测的中心城市
-- lookback L、horizon H
-- 邻域城市选择方式（all / topk_corr）
-- 训练/验证/测试按年份划分
-- 是否做分位数预测、分位数集合等
+## 3.4 训练脚本已支持的关键能力
+- AMP：使用 `torch.amp.autocast` + `torch.amp.GradScaler`
+- 完整 checkpoint：保存 `model/optimizer/scheduler/scaler/global_iter/rng_state/history`
+- best 模型保存：`best.pt` 与 `best.ckpt`
 
-## 3. 输出
-- `runs/<exp_name>/best.pt`：最佳模型
-- `runs/<exp_name>/metrics.json`：测试指标
-- `runs/<exp_name>/predictions.csv`：预测与真实值（便于画图）
-- `runs/<exp_name>/<target_city>/last.ckpt`：完整训练状态（model/optimizer/scaler/scheduler/随机状态）
+## 4. 使用真正的 Mamba（禁用 GRU 回退）
 
-## 4. 常见问题
-- 若提示 `mamba_ssm` 缺失：不会影响运行，会自动用 GRU 代替；要与论文一致建议安装 `mamba-ssm`。
-- 若你要“轮流预测所有城市”：在配置中设置 `target_city: "__all__"`，脚本会自动循环训练/测试并汇总结果（耗时更久）。
+若看到警告：
+`mamba_ssm not found. Using GRU fallback.`
+说明当前未启用真正的 Mamba。
+
+## 4.1 安装编译依赖（Ubuntu）
+
+```bash
+apt update
+apt install -y build-essential gcc g++ ninja-build
+```
+
+## 4.2 安装 `causal-conv1d` 与 `mamba-ssm`
+
+```bash
+export CC=/usr/bin/gcc
+export CXX=/usr/bin/g++
+export CUDA_HOME=/usr/local/cuda
+export MAX_JOBS=4
+
+pip install -U pip setuptools wheel packaging
+pip install -i https://pypi.org/simple --no-build-isolation causal-conv1d
+pip install -i https://pypi.org/simple --no-build-isolation mamba-ssm
+```
+
+验证：
+
+```bash
+python -c "import mamba_ssm, causal_conv1d; print('mamba ok')"
+```
+
+## 5. 训练输出说明
+
+按城市输出（`runs/<exp_name>/<city>/`）：
+- `best.pt`: 最优模型权重（推理常用）
+- `best.ckpt`: 最优检查点（含配置与最优分数）
+- `last.ckpt`: 最近一次完整训练状态（用于续训）
+- `predictions.csv`: 预测结果
+- `history.csv`: 每轮训练日志
+- `metrics.json`: 单城市指标
+
+实验级汇总（`runs/<exp_name>/`）：
+- `metrics_all.json`
+- `predictions_all.csv`
+- `history_all.csv`
+- `plots/` 或你指定的 `figures/`
+
+## 6. 可视化
+
+## 6.1 训练曲线与指标图
+
+```bash
+python scripts/plot_results.py --exp_dir runs/gz_rain_da_deformmamba
+```
+
+可选参数：
+- `--horizon`
+- `--tail_points`
+- `--cities`（逗号分隔城市名）
+
+## 6.2 预测时序图
+
+```bash
+python scripts/plot_predictions.py \
+  --pred_csv runs/gz_rain_da_deformmamba/predictions_all.csv \
+  --out_dir runs/gz_rain_da_deformmamba/figures
+```
+
+## 6.3 中文乱码处理
+
+如果图中中文乱码，先安装中文字体：
+
+```bash
+apt update && apt install -y fonts-noto-cjk
+```
+
+本仓库绘图脚本已自动尝试以下字体：
+- `Noto Sans CJK SC`
+- `Source Han Sans CN`
+- `Microsoft YaHei`
+- `SimHei`
+- `WenQuanYi Zen Hei`
+- `PingFang SC`
+
+如仍乱码，清理 Matplotlib 缓存后重画：
+
+```bash
+python -c "import matplotlib as mpl, shutil; shutil.rmtree(mpl.get_cachedir(), ignore_errors=True)"
+python scripts/plot_results.py --exp_dir runs/gz_rain_da_deformmamba
+python scripts/plot_predictions.py --pred_csv runs/gz_rain_da_deformmamba/predictions_all.csv --out_dir runs/gz_rain_da_deformmamba/figures
+```
+
+注意：已生成的乱码图片不能直接修复，必须重新绘图。
+
+## 7. 远程训练建议（防断线）
+
+安装并使用 `tmux`：
+
+```bash
+apt update && apt install -y tmux
+tmux new -s rain
+source venv/bin/activate
+python scripts/train.py --config configs/gz_rain.yaml
+```
+
+常用命令：
+- 查看会话：`tmux ls`
+- 进入会话：`tmux attach -t rain`
+- 分离会话：`Ctrl+b` 后按 `d`
+
+## 8. 成果打包与下载
+
+## 8.1 服务器打包
+
+```bash
+cd ~/260219_ML-rainfall-time-prediction
+tar -czvf rain_results_$(date +%Y%m%d_%H%M%S).tar.gz runs/gz_rain_da_deformmamba
+```
+
+建议连同配置与依赖一起打包：
+
+```bash
+tar -czvf rain_bundle_$(date +%Y%m%d_%H%M%S).tar.gz \
+  runs/gz_rain_da_deformmamba \
+  configs \
+  requirements*.txt
+```
+
+## 8.2 下载到本地
+
+```bash
+scp root@<SERVER_IP>:~/260219_ML-rainfall-time-prediction/rain_bundle_*.tar.gz .
+```
+
+本地解压：
+
+```bash
+tar -xzvf rain_bundle_*.tar.gz
+```
+
+## 9. 常见问题（FAQ）
+
+1. `ModuleNotFoundError: No module named 'utils'`
+- 已在 `scripts/train.py` 内处理项目根路径导入。
+- 旧版本可临时用：`PYTHONPATH=. python scripts/train.py --config ...`
+
+2. `FileNotFoundError`（数据文件找不到）
+- 检查配置里的 `data_path` 是否与真实路径一致。
+
+3. `mamba-ssm` 安装失败 / `g++ not found`
+- 先安装：`apt install -y build-essential gcc g++ ninja-build`
+
+4. `plot_results.py` 报参数错误
+- 必填参数是 `--exp_dir`。
+
+5. `plot_predictions.py` 报参数错误
+- 必填参数是 `--pred_csv` 和 `--out_dir`。
+
+## 10. 复现建议
+
+- 每次实验固定随机种子和配置文件。
+- 训练前保存 Git commit id。
+- 每次训练后保存：
+  - `metrics_all.json`
+  - `history_all.csv`
+  - 当前依赖锁文件（如 `requirements-lock-linux-py310.txt`）
+
