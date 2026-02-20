@@ -18,6 +18,11 @@ Python >= 3.9，建议使用 conda/venv。
 pip install -r requirements.txt
 ```
 
+若你希望固定当前环境版本（推荐云上训练）：
+```bash
+pip install -r requirements-lock.txt
+```
+
 若你希望启用真正的 Mamba（而非 GRU 退化版本），请额外安装：
 ```bash
 pip install mamba-ssm
@@ -36,6 +41,16 @@ pip install mamba-ssm
 python scripts/train.py --config configs/gz_rain.yaml
 ```
 
+断点续训（自动读取 `runs/<exp_name>/<target_city>/last.ckpt`）：
+```bash
+python scripts/train.py --config configs/gz_rain.yaml --resume
+```
+
+从指定 checkpoint 续训（仅单目标）：
+```bash
+python scripts/train.py --config configs/gz_rain.yaml --resume_path runs/<exp_name>/<target_city>/last.ckpt
+```
+
 你可以在 `configs/gz_rain.yaml` 中修改：
 - target_city：预测的中心城市
 - lookback L、horizon H
@@ -47,8 +62,8 @@ python scripts/train.py --config configs/gz_rain.yaml
 - `runs/<exp_name>/best.pt`：最佳模型
 - `runs/<exp_name>/metrics.json`：测试指标
 - `runs/<exp_name>/predictions.csv`：预测与真实值（便于画图）
+- `runs/<exp_name>/<target_city>/last.ckpt`：完整训练状态（model/optimizer/scaler/scheduler/随机状态）
 
 ## 4. 常见问题
 - 若提示 `mamba_ssm` 缺失：不会影响运行，会自动用 GRU 代替；要与论文一致建议安装 `mamba-ssm`。
 - 若你要“轮流预测所有城市”：在配置中设置 `target_city: "__all__"`，脚本会自动循环训练/测试并汇总结果（耗时更久）。
-

@@ -1,5 +1,8 @@
 import os
+import sys
 import argparse
+import random
+from contextlib import nullcontext
 import yaml
 import numpy as np
 import pandas as pd
@@ -8,7 +11,11 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from utils import set_seed, ensure_dir, save_json, to_numpy
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from utils import set_seed, ensure_dir, save_json
 from data import load_gz_rainfall_xlsx, add_time_features, split_by_year, StandardScaler
 from dataset import SlidingWindowDataset
 from gmm_domain import compute_window_stats, fit_gmm_bic, predict_domain
@@ -33,7 +40,48 @@ def lambda_schedule(curr_iter, max_iter, gamma=10.0):
     lamb = 2.0 / (1.0 + np.exp(-gamma * p)) - 1.0
     return float(lamb)
 
-def run_one_target(cfg, df, target_city: str, device: str):
+def get_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+def set_rng_state(state):
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if "torch_cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+def resolve_amp_dtype(cfg):
+    amp_dtype_cfg = str(cfg["train"].get("amp_dtype", "fp16")).lower()
+    if amp_dtype_cfg == "bf16":
+        return torch.bfloat16, "bf16"
+    return torch.float16, "fp16"
+
+def build_scheduler(cfg, optimizer):
+    scheduler_cfg = cfg["train"].get("scheduler", {"type": "none"})
+    scheduler_type = str(scheduler_cfg.get("type", "none")).lower()
+    if scheduler_type == "cosine":
+        eta_min = float(scheduler_cfg.get("eta_min", 0.0))
+        t_max = int(scheduler_cfg.get("t_max", cfg["train"]["epochs"]))
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
+    if scheduler_type == "step":
+        step_size = int(scheduler_cfg.get("step_size", 10))
+        gamma = float(scheduler_cfg.get("gamma", 0.5))
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    return None
+
+def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resume_path: str | None = None):
     L = int(cfg["lookback_L"])
     H = int(cfg["horizon_H"])
     use_time = bool(cfg["use_time_features"])
@@ -83,8 +131,8 @@ def run_one_target(cfg, df, target_city: str, device: str):
     # 计算 GMM 子域（在训练样本窗口上 fit）
     S_all = compute_window_stats(X_all_z, y_all, L=L, H=H)
     S_train = S_all[train_mask]
-    gmm, k_best, bic = fit_gmm_bic(S_train, k_min=cfg["gmm"]["k_min"], k_max=cfg["gmm"]["k_max"],
-                                  random_state=cfg["gmm"]["random_state"])
+    gmm, k_best, _ = fit_gmm_bic(S_train, k_min=cfg["gmm"]["k_min"], k_max=cfg["gmm"]["k_max"],
+                                 random_state=cfg["gmm"]["random_state"])
     domain_all = predict_domain(gmm, S_all)  # [-1 for invalid]
     num_domains = int(k_best)
 
@@ -120,7 +168,17 @@ def run_one_target(cfg, df, target_city: str, device: str):
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
-    scaler_amp = torch.cuda.amp.GradScaler(enabled=bool(cfg["train"]["use_amp"]) and device.startswith("cuda"))
+    scheduler = build_scheduler(cfg, opt)
+    amp_dtype, amp_dtype_name = resolve_amp_dtype(cfg)
+    amp_enabled = bool(cfg["train"]["use_amp"]) and device.startswith("cuda")
+    scaler_amp = torch.amp.GradScaler(
+        device="cuda",
+        enabled=amp_enabled and amp_dtype == torch.float16
+    )
+    autocast_ctx = (
+        lambda: torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+        if amp_enabled else nullcontext()
+    )
 
     beta = float(cfg["domain_adv"]["beta"]) if cfg["domain_adv"]["enabled"] else 0.0
     gamma = float(cfg["domain_adv"]["grl_gamma"])
@@ -133,8 +191,27 @@ def run_one_target(cfg, df, target_city: str, device: str):
     best_state = None
     global_iter = 0
     history_rows = []
+    start_epoch = 1
+    last_ckpt_path = os.path.join(target_dir, "last.ckpt")
+    best_ckpt_path = os.path.join(target_dir, "best.ckpt")
 
-    for epoch in range(1, cfg["train"]["epochs"] + 1):
+    if resume_path and os.path.exists(resume_path):
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        opt.load_state_dict(checkpoint["optimizer_state"])
+        if scheduler is not None and checkpoint.get("scheduler_state") is not None:
+            scheduler.load_state_dict(checkpoint["scheduler_state"])
+        if checkpoint.get("scaler_state") is not None and scaler_amp.is_enabled():
+            scaler_amp.load_state_dict(checkpoint["scaler_state"])
+        set_rng_state(checkpoint.get("rng_state"))
+        best_val = float(checkpoint.get("best_val", best_val))
+        best_state = checkpoint.get("best_model_state")
+        global_iter = int(checkpoint.get("global_iter", 0))
+        history_rows = checkpoint.get("history_rows", [])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        print(f"[{target_city}] resumed from {resume_path} at epoch {start_epoch}")
+
+    for epoch in range(start_epoch, cfg["train"]["epochs"] + 1):
         model.train()
         pbar = tqdm(tr_loader, desc=f"[{target_city}] epoch {epoch}")
         epoch_loss, epoch_task, epoch_dom = [], [], []
@@ -153,8 +230,8 @@ def run_one_target(cfg, df, target_city: str, device: str):
             lamb_last = float(lamb)
 
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=scaler_amp.is_enabled()):
-                pred, dom_logits, feat = model(xb, grl_lambda=lamb)
+            with autocast_ctx():
+                pred, dom_logits, _ = model(xb, grl_lambda=lamb)
 
                 if task_mode == "point":
                     task_loss = mse_loss(yb, pred)
@@ -186,12 +263,43 @@ def run_one_target(cfg, df, target_city: str, device: str):
             "train_dom_loss_mean": float(np.mean(epoch_dom)) if epoch_dom else np.nan,
             "val_rmse": float(val_rmse),
             "grl_lambda_last": float(lamb_last),
+            "lr": float(opt.param_groups[0]["lr"]),
         })
         if val_rmse < best_val:
             best_val = val_rmse
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            torch.save({
+                "version": 1,
+                "target_city": target_city,
+                "epoch": int(epoch),
+                "best_val": float(best_val),
+                "best_model_state": best_state,
+                "config": cfg,
+            }, best_ckpt_path)
+
+        if scheduler is not None:
+            scheduler.step()
+
+        torch.save({
+            "version": 1,
+            "target_city": target_city,
+            "epoch": int(epoch),
+            "global_iter": int(global_iter),
+            "best_val": float(best_val),
+            "model_state": model.state_dict(),
+            "optimizer_state": opt.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+            "scaler_state": scaler_amp.state_dict() if scaler_amp.is_enabled() else None,
+            "best_model_state": best_state,
+            "history_rows": history_rows,
+            "rng_state": get_rng_state(),
+            "amp": {"enabled": amp_enabled, "dtype": amp_dtype_name},
+            "config": cfg,
+        }, last_ckpt_path)
 
     # test
+    if best_state is None:
+        best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
     test_metrics, pred_df = test_and_dump(model, te_loader, device, task_mode, quantiles, target_city)
     history_df = pd.DataFrame(history_rows)
@@ -201,7 +309,7 @@ def run_one_target(cfg, df, target_city: str, device: str):
         "num_domains": num_domains,
         "best_val_rmse": float(best_val),
         **test_metrics
-    }, pred_df, history_df, best_state, scaler, gmm
+    }, pred_df, history_df, best_state
 
 @torch.no_grad()
 def evaluate(model, loader, device, task_mode, quantiles):
@@ -283,6 +391,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--resume", action="store_true", help="Resume from runs/<exp_name>/<target_city>/last.ckpt")
+    parser.add_argument("--resume_path", type=str, default=None, help="Resume from a specific checkpoint path")
     args = parser.parse_args()
 
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
@@ -314,7 +424,19 @@ def main():
     all_history = []
 
     for tcity in targets:
-        metrics, pred_df, history_df, best_state, scaler, gmm = run_one_target(cfg, df, tcity, args.device)
+        tdir = os.path.join(exp_dir, tcity)
+        ensure_dir(tdir)
+        resume_path = None
+        if args.resume_path is not None:
+            if len(targets) != 1:
+                raise ValueError("--resume_path only supports single target training")
+            resume_path = args.resume_path
+        elif args.resume:
+            candidate = os.path.join(tdir, "last.ckpt")
+            if os.path.exists(candidate):
+                resume_path = candidate
+        metrics, pred_df, history_df, best_state = run_one_target(cfg, df, tcity, args.device, tdir, resume_path=resume_path)
+
         all_metrics.append(metrics)
         all_pred.append(pred_df)
         history_df = history_df.copy()
@@ -322,8 +444,6 @@ def main():
         all_history.append(history_df)
 
         # save model
-        tdir = os.path.join(exp_dir, tcity)
-        ensure_dir(tdir)
         torch.save(best_state, os.path.join(tdir, "best.pt"))
         pred_df.to_csv(os.path.join(tdir, "predictions.csv"), index=False)
         history_df.to_csv(os.path.join(tdir, "history.csv"), index=False)
