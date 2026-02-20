@@ -2,6 +2,7 @@ import argparse
 import os
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import pandas as pd
 
 
@@ -13,6 +14,22 @@ def parse_args():
     parser.add_argument("--tail_points", type=int, default=300, help="Tail points for each city plot")
     parser.add_argument("--max_cities", type=int, default=None, help="Optional max number of cities to plot")
     return parser.parse_args()
+
+def configure_matplotlib_for_chinese():
+    preferred_fonts = [
+        "Noto Sans CJK SC",
+        "Source Han Sans CN",
+        "Microsoft YaHei",
+        "SimHei",
+        "WenQuanYi Zen Hei",
+        "PingFang SC",
+    ]
+    installed = {f.name for f in font_manager.fontManager.ttflist}
+    chosen = next((name for name in preferred_fonts if name in installed), None)
+    if chosen:
+        plt.rcParams["font.sans-serif"] = [chosen]
+        plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["axes.unicode_minus"] = False
 
 
 def plot_one_city(df_city: pd.DataFrame, city: str, out_path: str):
@@ -42,6 +59,7 @@ def plot_one_city(df_city: pd.DataFrame, city: str, out_path: str):
 
 def main():
     args = parse_args()
+    configure_matplotlib_for_chinese()
     os.makedirs(args.out_dir, exist_ok=True)
 
     df = pd.read_csv(args.pred_csv)

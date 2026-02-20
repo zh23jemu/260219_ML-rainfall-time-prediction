@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import pandas as pd
 
 
@@ -14,6 +15,22 @@ def parse_args():
     parser.add_argument("--tail_points", type=int, default=300, help="Tail points for prediction plots")
     parser.add_argument("--cities", type=str, default="", help="Optional comma-separated city list")
     return parser.parse_args()
+
+def configure_matplotlib_for_chinese():
+    preferred_fonts = [
+        "Noto Sans CJK SC",
+        "Source Han Sans CN",
+        "Microsoft YaHei",
+        "SimHei",
+        "WenQuanYi Zen Hei",
+        "PingFang SC",
+    ]
+    installed = {f.name for f in font_manager.fontManager.ttflist}
+    chosen = next((name for name in preferred_fonts if name in installed), None)
+    if chosen:
+        plt.rcParams["font.sans-serif"] = [chosen]
+        plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["axes.unicode_minus"] = False
 
 
 def resolve_cities(exp_dir: Path, cities_arg: str):
@@ -95,6 +112,7 @@ def plot_metrics_bar(metrics_df: pd.DataFrame, out_path: Path):
 
 def main():
     args = parse_args()
+    configure_matplotlib_for_chinese()
     exp_dir = Path(args.exp_dir)
     if not exp_dir.exists():
         raise FileNotFoundError(f"exp_dir not found: {exp_dir}")
