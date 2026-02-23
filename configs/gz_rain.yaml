@@ -1,5 +1,5 @@
-exp_name: gz_rain_da_deformmamba
-data_path: data/2015-2024贵州降水数据(1).xlsx
+exp_name: gz_rain_da_deformmamba_guiyang_tune2
+data_path: 20152024.xlsx
 
 # 目标城市：填具体列名，例如 "贵阳市"；填 "__all__" 则轮流训练每个城市并汇总
 target_city: "贵阳市"
@@ -46,7 +46,7 @@ train:
 
 # 域对抗
 domain_adv:
-  enabled: true
+  enabled: false
   beta: 0.2               # 总损失 = task + beta * domain
   grl_gamma: 10.0         # lambda schedule 的 gamma
   max_iter: 20000         # schedule 上限（近似）
@@ -55,7 +55,7 @@ domain_adv:
 # 任务：point | quantile
 task:
   mode: "quantile"
-  quantiles: [0.1, 0.5, 0.9]
+  quantiles: [0.05, 0.5, 0.95]
   use_huber_pinball: true
   huber_delta: 1.0
   target_transform: "log1p"   # none | log1p | asinh
@@ -63,4 +63,4 @@ task:
   rain_weighting:
     enabled: true
     thresholds: [0.1, 10.0, 25.0, 50.0]
-    weights: [1.0, 1.5, 2.5, 4.0, 6.0]
+    weights: [1.0, 1.2, 2.0, 3.0, 5.0]
