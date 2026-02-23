@@ -81,6 +81,39 @@ def build_scheduler(cfg, optimizer):
         return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
     return None
 
+def transform_target_torch(y: torch.Tensor, task_cfg: dict):
+    transform = str(task_cfg.get("target_transform", "none")).lower()
+    if transform == "log1p":
+        return torch.log1p(torch.clamp(y, min=0.0))
+    if transform == "asinh":
+        scale = float(task_cfg.get("asinh_scale", 1.0))
+        return torch.asinh(torch.clamp(y, min=0.0) / max(scale, 1e-6))
+    return y
+
+def inverse_target_torch(z: torch.Tensor, task_cfg: dict):
+    transform = str(task_cfg.get("target_transform", "none")).lower()
+    if transform == "log1p":
+        return torch.clamp(torch.expm1(z), min=0.0)
+    if transform == "asinh":
+        scale = float(task_cfg.get("asinh_scale", 1.0))
+        return torch.clamp(torch.sinh(z) * scale, min=0.0)
+    return z
+
+def rain_sample_weight(y_raw: torch.Tensor, task_cfg: dict):
+    rain_cfg = task_cfg.get("rain_weighting", {})
+    if not bool(rain_cfg.get("enabled", False)):
+        return None
+
+    thresholds = [float(x) for x in rain_cfg.get("thresholds", [0.1, 10.0, 25.0, 50.0])]
+    weights = [float(x) for x in rain_cfg.get("weights", [1.0, 1.5, 2.5, 4.0, 6.0])]
+    if len(weights) != len(thresholds) + 1:
+        raise ValueError("task.rain_weighting.weights length must equal len(thresholds)+1")
+
+    w = torch.full_like(y_raw, fill_value=weights[0], dtype=torch.float32)
+    for t, wt in zip(thresholds, weights[1:]):
+        w = torch.where(y_raw >= t, torch.full_like(w, wt), w)
+    return w
+
 def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resume_path: str | None = None):
     L = int(cfg["lookback_L"])
     H = int(cfg["horizon_H"])
@@ -186,6 +219,7 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
 
     use_huber = bool(cfg["task"]["use_huber_pinball"])
     delta = float(cfg["task"]["huber_delta"])
+    task_cfg = cfg["task"]
 
     best_val = 1e18
     best_state = None
@@ -218,7 +252,8 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
         lamb_last = 0.0
         for xb, yb, db in pbar:
             xb = xb.to(device)
-            yb = yb.to(device)
+            yb_raw = yb.to(device)
+            yb_train = transform_target_torch(yb_raw, task_cfg)
             db = db.to(device)
 
             # domain labels：过滤掉 -1（无效），避免 CE 报错
@@ -232,11 +267,14 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
             opt.zero_grad(set_to_none=True)
             with autocast_ctx():
                 pred, dom_logits, _ = model(xb, grl_lambda=lamb)
+                sw = rain_sample_weight(yb_raw, task_cfg)
 
                 if task_mode == "point":
-                    task_loss = mse_loss(yb, pred)
+                    task_loss = mse_loss(yb_train, pred, sample_weight=sw)
                 else:
-                    task_loss = quantile_loss(yb, pred, quantiles, use_huber=use_huber, delta=delta)
+                    task_loss = quantile_loss(
+                        yb_train, pred, quantiles, use_huber=use_huber, delta=delta, sample_weight=sw
+                    )
 
                 dom_loss = domain_ce_loss(dom_logits[valid_domain], db[valid_domain])
                 loss = task_loss + beta * dom_loss
@@ -255,7 +293,7 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
             pbar.set_postfix({"loss": float(loss.item()), "task": float(task_loss.item()), "dom": float(dom_loss.item()), "λ": lamb})
 
         # validation (use RMSE on median/point)
-        val_rmse = evaluate(model, va_loader, device, task_mode, quantiles)
+        val_rmse = evaluate(model, va_loader, device, task_mode, quantiles, task_cfg)
         history_rows.append({
             "epoch": int(epoch),
             "train_loss_mean": float(np.mean(epoch_loss)) if epoch_loss else np.nan,
@@ -301,7 +339,7 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
     if best_state is None:
         best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
-    test_metrics, pred_df = test_and_dump(model, te_loader, device, task_mode, quantiles, target_city)
+    test_metrics, pred_df = test_and_dump(model, te_loader, device, task_mode, quantiles, target_city, task_cfg)
     history_df = pd.DataFrame(history_rows)
 
     return {
@@ -312,28 +350,28 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
     }, pred_df, history_df, best_state
 
 @torch.no_grad()
-def evaluate(model, loader, device, task_mode, quantiles):
+def evaluate(model, loader, device, task_mode, quantiles, task_cfg):
     model.eval()
     ys, ps = [], []
     for xb, yb, db in loader:
         xb = xb.to(device)
-        yb = yb.to(device)
+        yb_raw = yb.to(device)
         pred, _, _ = model(xb, grl_lambda=0.0)
         if task_mode == "point":
-            p = pred
+            p = inverse_target_torch(pred, task_cfg)
         else:
             # 用中位数分位数做点估计（tau=0.5）
             q = list(quantiles)
             mid = q.index(0.5) if 0.5 in q else len(q)//2
-            p = pred[..., mid]
-        ys.append(yb.cpu().numpy())
+            p = inverse_target_torch(pred[..., mid], task_cfg)
+        ys.append(yb_raw.cpu().numpy())
         ps.append(p.cpu().numpy())
     y = np.concatenate(ys, axis=0).reshape(-1)
     p = np.concatenate(ps, axis=0).reshape(-1)
     return rmse(y, p)
 
 @torch.no_grad()
-def test_and_dump(model, loader, device, task_mode, quantiles, target_city):
+def test_and_dump(model, loader, device, task_mode, quantiles, target_city, task_cfg):
     model.eval()
     ys, p50s, los, his = [], [], [], []
     for xb, yb, db in loader:
@@ -342,11 +380,11 @@ def test_and_dump(model, loader, device, task_mode, quantiles, target_city):
         y = yb.numpy()
 
         if task_mode == "point":
-            p = pred.cpu().numpy()
+            p = inverse_target_torch(pred, task_cfg).cpu().numpy()
             p50 = p
             lo = hi = None
         else:
-            p_np = pred.cpu().numpy()  # [B,H,Q]
+            p_np = inverse_target_torch(pred, task_cfg).cpu().numpy()  # [B,H,Q]
             q = list(quantiles)
             mid = q.index(0.5) if 0.5 in q else len(q)//2
             p50 = p_np[..., mid]

@@ -58,3 +58,9 @@ task:
   quantiles: [0.1, 0.5, 0.9]
   use_huber_pinball: true
   huber_delta: 1.0
+  target_transform: "log1p"   # none | log1p | asinh
+  asinh_scale: 10.0
+  rain_weighting:
+    enabled: true
+    thresholds: [0.1, 10.0, 25.0, 50.0]
+    weights: [1.0, 1.5, 2.5, 4.0, 6.0]
