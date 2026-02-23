@@ -2,7 +2,7 @@ exp_name: gz_rain_da_deformmamba_guiyang_tune3
 data_path: 20152024.xlsx
 
 # 目标城市：填具体列名，例如 "贵阳市"；填 "__all__" 则轮流训练每个城市并汇总
-target_city: "贵阳市"
+target_city: "__all__"
 
 # 输入构造
 lookback_L: 90
