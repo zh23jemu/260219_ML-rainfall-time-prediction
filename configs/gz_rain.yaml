@@ -1,4 +1,4 @@
-exp_name: gz_rain_da_deformmamba_guiyang_tune2
+exp_name: gz_rain_da_deformmamba_guiyang_tune3
 data_path: 20152024.xlsx
 
 # 目标城市：填具体列名，例如 "贵阳市"；填 "__all__" 则轮流训练每个城市并汇总
@@ -67,4 +67,4 @@ task:
   rain_weighting:
     enabled: true
     thresholds: [0.1, 10.0, 25.0, 50.0]
-    weights: [1.0, 1.2, 2.0, 3.5, 6.0]
+    weights: [1.0, 1.2, 2.0, 3.0, 5.0]
