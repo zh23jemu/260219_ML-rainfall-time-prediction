@@ -40,9 +40,13 @@ train:
   num_workers: 0
   lr: 0.0008
   weight_decay: 0.0001
-  epochs: 40
+  epochs: 15
   grad_clip: 1.0
   use_amp: true
+  early_stopping:
+    enabled: true
+    patience: 5
+    min_delta: 0.0
 
 # 域对抗
 domain_adv:
@@ -63,4 +67,4 @@ task:
   rain_weighting:
     enabled: true
     thresholds: [0.1, 10.0, 25.0, 50.0]
-    weights: [1.0, 1.2, 2.0, 3.0, 5.0]
+    weights: [1.0, 1.2, 2.0, 3.5, 6.0]

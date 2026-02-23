@@ -81,6 +81,13 @@ def build_scheduler(cfg, optimizer):
         return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
     return None
 
+def early_stopping_cfg(cfg):
+    es = cfg["train"].get("early_stopping", {})
+    enabled = bool(es.get("enabled", False))
+    patience = int(es.get("patience", 5))
+    min_delta = float(es.get("min_delta", 0.0))
+    return enabled, patience, min_delta
+
 def transform_target_torch(y: torch.Tensor, task_cfg: dict):
     transform = str(task_cfg.get("target_transform", "none")).lower()
     if transform == "log1p":
@@ -220,11 +227,13 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
     use_huber = bool(cfg["task"]["use_huber_pinball"])
     delta = float(cfg["task"]["huber_delta"])
     task_cfg = cfg["task"]
+    es_enabled, es_patience, es_min_delta = early_stopping_cfg(cfg)
 
     best_val = 1e18
     best_state = None
     global_iter = 0
     history_rows = []
+    epochs_no_improve = 0
     start_epoch = 1
     last_ckpt_path = os.path.join(target_dir, "last.ckpt")
     best_ckpt_path = os.path.join(target_dir, "best.ckpt")
@@ -303,8 +312,10 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
             "grl_lambda_last": float(lamb_last),
             "lr": float(opt.param_groups[0]["lr"]),
         })
-        if val_rmse < best_val:
+        improved = val_rmse < (best_val - es_min_delta)
+        if improved:
             best_val = val_rmse
+            epochs_no_improve = 0
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
             torch.save({
                 "version": 1,
@@ -314,6 +325,8 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
                 "best_model_state": best_state,
                 "config": cfg,
             }, best_ckpt_path)
+        else:
+            epochs_no_improve += 1
 
         if scheduler is not None:
             scheduler.step()
@@ -334,6 +347,10 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
             "amp": {"enabled": amp_enabled, "dtype": amp_dtype_name},
             "config": cfg,
         }, last_ckpt_path)
+
+        if es_enabled and epochs_no_improve >= es_patience:
+            print(f"[{target_city}] early stopped at epoch {epoch} (patience={es_patience})")
+            break
 
     # test
     if best_state is None:
