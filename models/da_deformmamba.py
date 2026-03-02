@@ -19,6 +19,11 @@ class DADeformMamba(nn.Module):
                  d_model: int = 128,
                  deform_layers: int = 2, deform_heads: int = 8, deform_groups: int = 4, deform_kernel: int = 7,
                  conbimamba_layers: int = 3,
+                 spatial_deform_enabled: bool = False,
+                 spatial_deform_layers: int = 1,
+                 spatial_deform_heads: int = 4,
+                 spatial_deform_groups: int = 4,
+                 spatial_deform_kernel: int = 5,
                  dropout: float = 0.1,
                  require_mamba: bool = False,
                  task_mode: str = "quantile",
@@ -32,8 +37,9 @@ class DADeformMamba(nn.Module):
         self.num_domains = num_domains
         self.task_mode = task_mode
         self.quantiles = list(quantiles)
+        self.use_spatial_deform = bool(spatial_deform_enabled and V_in > 1)
 
-        # 空间变量融合：每个时间步把 V 维投影到 d_model
+        # 时间分支：每个时间步把 V 维投影到 d_model
         self.in_proj = nn.Linear(V_in, d_model)
         self.pos_emb = nn.Parameter(torch.zeros(1, L, d_model))
         nn.init.normal_(self.pos_emb, std=0.02)
@@ -55,8 +61,40 @@ class DADeformMamba(nn.Module):
             require_mamba=require_mamba,
         )
 
-        # pooling：取最后时间步（也可改成 mean pooling）
-        self.norm_out = nn.LayerNorm(d_model)
+        self.temporal_norm_out = nn.LayerNorm(d_model)
+
+        # 空间分支：对城市维(V)做 deform + BiMamba，显式建模空间传播关系
+        if self.use_spatial_deform:
+            self.spatial_in_proj = nn.Linear(L, d_model)
+            self.spatial_pos_emb = nn.Parameter(torch.zeros(1, V_in, d_model))
+            nn.init.normal_(self.spatial_pos_emb, std=0.02)
+            self.spatial_drop = nn.Dropout(dropout)
+            self.spatial_deform = nn.ModuleList([
+                DeformBlock(
+                    seq_len=V_in,
+                    d_model=d_model,
+                    n_heads=spatial_deform_heads,
+                    n_groups=spatial_deform_groups,
+                    kernel=spatial_deform_kernel,
+                    dropout=dropout
+                )
+                for _ in range(spatial_deform_layers)
+            ])
+            self.spatial_mamba = ConBiMambaEncoder(
+                d_model=d_model,
+                num_layers=max(1, conbimamba_layers // 2),
+                dropout=dropout,
+                conv_kernel=15,
+                require_mamba=require_mamba,
+            )
+            self.spatial_norm_out = nn.LayerNorm(d_model)
+
+            self.fuse = nn.Sequential(
+                nn.Linear(2 * d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.LayerNorm(d_model),
+            )
 
         # prediction head
         if task_mode == "point":
@@ -87,7 +125,20 @@ class DADeformMamba(nn.Module):
 
         z = self.mamba(z)
 
-        feat = self.norm_out(z[:, -1, :])  # [B,d]
+        feat_temporal = self.temporal_norm_out(z[:, -1, :])  # [B,d]
+
+        if self.use_spatial_deform:
+            # x: [B,L,V] -> [B,V,L]，将每个城市的L长度序列映射为城市token
+            z_sp = self.spatial_in_proj(x.transpose(1, 2)) + self.spatial_pos_emb
+            z_sp = self.spatial_drop(z_sp)
+            for blk in self.spatial_deform:
+                z_sp = blk(z_sp)
+            z_sp = self.spatial_mamba(z_sp)
+            feat_spatial = self.spatial_norm_out(z_sp.mean(dim=1))
+            feat = self.fuse(torch.cat([feat_temporal, feat_spatial], dim=-1))
+        else:
+            feat = feat_temporal
+
         # task pred
         out = self.head(feat)
         if self.task_mode == "quantile":
