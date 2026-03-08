@@ -11,7 +11,20 @@ def load_gz_rainfall_xlsx(path: str) -> pd.DataFrame:
     else:
         date_col = df.columns[0]
     df = df.rename(columns={date_col: "date"})
-    df["date"] = pd.to_datetime(df["date"])
+    date_raw = df["date"]
+    if pd.api.types.is_numeric_dtype(date_raw):
+        df["date"] = pd.to_datetime(date_raw, unit="D", origin="1899-12-30")
+    else:
+        parsed = pd.to_datetime(date_raw, errors="coerce")
+        numeric = pd.to_numeric(date_raw, errors="coerce")
+        excel_mask = parsed.isna() & numeric.notna()
+        if excel_mask.any():
+            parsed.loc[excel_mask] = pd.to_datetime(
+                numeric.loc[excel_mask], unit="D", origin="1899-12-30"
+            )
+        df["date"] = parsed
+    if df["date"].isna().any():
+        raise ValueError(f"Failed to parse some dates from {path}")
     df = df.sort_values("date").reset_index(drop=True)
     return df
 

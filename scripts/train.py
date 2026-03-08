@@ -19,7 +19,7 @@ from utils import set_seed, ensure_dir, save_json
 from data import load_gz_rainfall_xlsx, add_time_features, split_by_year, StandardScaler
 from dataset import SlidingWindowDataset
 from gmm_domain import compute_window_stats, fit_gmm_bic, predict_domain
-from models import DADeformMamba
+from models import DADeformMamba, SimpleBiMambaForecast
 from losses import mse_loss, quantile_loss, domain_ce_loss
 from metrics import rmse, mae, picp, pinaw, aql
 
@@ -127,16 +127,24 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
     use_time = bool(cfg["use_time_features"])
     neighbor_mode = cfg["neighbor_mode"]
     topk = int(cfg["topk"])
+    feature_mode = str(cfg.get("feature_mode", "all")).lower()
+    domain_adv_enabled = bool(cfg["domain_adv"]["enabled"])
+    model_name = str(cfg["model"].get("name", "da_deformmamba")).lower()
 
     # 城市列
     city_cols = [c for c in df.columns if c not in ["date", "doy_sin", "doy_cos"]]
     assert target_city in city_cols, f"target_city '{target_city}' not in columns: {city_cols}"
 
     # 特征矩阵（先不标准化）
-    if use_time:
-        feat_cols = city_cols + ["doy_sin", "doy_cos"]
+    if feature_mode == "target_only":
+        feat_cols = [target_city]
+    elif use_time:
+        feat_cols = list(city_cols)
     else:
-        feat_cols = city_cols
+        feat_cols = list(city_cols)
+
+    if use_time:
+        feat_cols = feat_cols + ["doy_sin", "doy_cos"]
 
     X_all = df[feat_cols].values.astype(np.float32)  # [T, V]
     y_all = df[target_city].values.astype(np.float32) # [T]
@@ -148,7 +156,7 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
     train_mask, val_mask, test_mask = split_by_year(df, train_years, val_years, test_years)
 
     # 仅在训练段上决定 neighbor 子集（如果 topk_corr）
-    if neighbor_mode == "topk_corr":
+    if neighbor_mode == "topk_corr" and feature_mode != "target_only":
         # 只在城市列上做相关排序，不包含时间特征
         X_city = df[city_cols].values.astype(np.float32)
         order = compute_corr_order(X_city[train_mask], y_all[train_mask])
@@ -168,13 +176,21 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
     scaler = StandardScaler().fit(X_all[train_mask])
     X_all_z = scaler.transform(X_all)
 
-    # 计算 GMM 子域（在训练样本窗口上 fit）
-    S_all = compute_window_stats(X_all_z, y_all, L=L, H=H)
-    S_train = S_all[train_mask]
-    gmm, k_best, _ = fit_gmm_bic(S_train, k_min=cfg["gmm"]["k_min"], k_max=cfg["gmm"]["k_max"],
-                                 random_state=cfg["gmm"]["random_state"])
-    domain_all = predict_domain(gmm, S_all)  # [-1 for invalid]
-    num_domains = int(k_best)
+    if domain_adv_enabled:
+        # 计算 GMM 子域（在训练样本窗口上 fit）
+        S_all = compute_window_stats(X_all_z, y_all, L=L, H=H)
+        S_train = S_all[train_mask]
+        gmm, k_best, _ = fit_gmm_bic(
+            S_train,
+            k_min=cfg["gmm"]["k_min"],
+            k_max=cfg["gmm"]["k_max"],
+            random_state=cfg["gmm"]["random_state"],
+        )
+        domain_all = predict_domain(gmm, S_all)  # [-1 for invalid]
+        num_domains = int(k_best)
+    else:
+        domain_all = np.zeros(len(df), dtype=np.int64)
+        num_domains = 1
 
     # 构造 Dataset（注意：domain 取 t 对应标签；t<L-1 或 t>T-H 为 -1）
     def make_loader(mask, shuffle):
@@ -182,8 +198,13 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
         y = y_all[mask]
         d = domain_all[mask]
         ds = SlidingWindowDataset(X, y, d, L=L, H=H)
-        return DataLoader(ds, batch_size=cfg["train"]["batch_size"], shuffle=shuffle,
-                          num_workers=cfg["train"]["num_workers"], drop_last=True)
+        return DataLoader(
+            ds,
+            batch_size=cfg["train"]["batch_size"],
+            shuffle=shuffle,
+            num_workers=cfg["train"]["num_workers"],
+            drop_last=shuffle,
+        )
 
     tr_loader = make_loader(train_mask, shuffle=True)
     va_loader = make_loader(val_mask, shuffle=False)
@@ -192,25 +213,40 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
     # 模型
     task_mode = cfg["task"]["mode"]
     quantiles = cfg["task"]["quantiles"]
-    model = DADeformMamba(
-        V_in=V_in, L=L, H=H, num_domains=num_domains,
-        d_model=cfg["model"]["d_model"],
-        deform_layers=cfg["model"]["deform_layers"],
-        deform_heads=cfg["model"]["deform_heads"],
-        deform_groups=cfg["model"]["deform_groups"],
-        deform_kernel=cfg["model"]["deform_kernel"],
-        conbimamba_layers=cfg["model"]["conbimamba_layers"],
-        spatial_deform_enabled=bool(cfg["model"].get("spatial_deform_enabled", False)),
-        spatial_deform_layers=int(cfg["model"].get("spatial_deform_layers", 1)),
-        spatial_deform_heads=int(cfg["model"].get("spatial_deform_heads", 4)),
-        spatial_deform_groups=int(cfg["model"].get("spatial_deform_groups", 4)),
-        spatial_deform_kernel=int(cfg["model"].get("spatial_deform_kernel", 5)),
-        dropout=cfg["model"]["dropout"],
-        require_mamba=bool(cfg["model"].get("require_mamba", False)),
-        task_mode=task_mode,
-        quantiles=quantiles,
-        domain_hidden=cfg["domain_adv"]["domain_hidden"],
-    ).to(device)
+    if model_name == "simple_bimamba":
+        model = SimpleBiMambaForecast(
+            V_in=V_in,
+            L=L,
+            H=H,
+            num_domains=num_domains,
+            d_model=cfg["model"]["d_model"],
+            num_layers=cfg["model"]["conbimamba_layers"],
+            dropout=cfg["model"]["dropout"],
+            require_mamba=bool(cfg["model"].get("require_mamba", False)),
+            task_mode=task_mode,
+            quantiles=quantiles,
+            domain_hidden=cfg["domain_adv"]["domain_hidden"],
+        ).to(device)
+    else:
+        model = DADeformMamba(
+            V_in=V_in, L=L, H=H, num_domains=num_domains,
+            d_model=cfg["model"]["d_model"],
+            deform_layers=cfg["model"]["deform_layers"],
+            deform_heads=cfg["model"]["deform_heads"],
+            deform_groups=cfg["model"]["deform_groups"],
+            deform_kernel=cfg["model"]["deform_kernel"],
+            conbimamba_layers=cfg["model"]["conbimamba_layers"],
+            spatial_deform_enabled=bool(cfg["model"].get("spatial_deform_enabled", False)),
+            spatial_deform_layers=int(cfg["model"].get("spatial_deform_layers", 1)),
+            spatial_deform_heads=int(cfg["model"].get("spatial_deform_heads", 4)),
+            spatial_deform_groups=int(cfg["model"].get("spatial_deform_groups", 4)),
+            spatial_deform_kernel=int(cfg["model"].get("spatial_deform_kernel", 5)),
+            dropout=cfg["model"]["dropout"],
+            require_mamba=bool(cfg["model"].get("require_mamba", False)),
+            task_mode=task_mode,
+            quantiles=quantiles,
+            domain_hidden=cfg["domain_adv"]["domain_hidden"],
+        ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
     scheduler = build_scheduler(cfg, opt)
@@ -225,7 +261,7 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
         if amp_enabled else nullcontext()
     )
 
-    beta = float(cfg["domain_adv"]["beta"]) if cfg["domain_adv"]["enabled"] else 0.0
+    beta = float(cfg["domain_adv"]["beta"]) if domain_adv_enabled else 0.0
     gamma = float(cfg["domain_adv"]["grl_gamma"])
     max_iter = int(cfg["domain_adv"]["max_iter"])
 
@@ -272,10 +308,10 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
 
             # domain labels：过滤掉 -1（无效），避免 CE 报错
             valid_domain = (db >= 0)
-            if valid_domain.sum() == 0:
+            if domain_adv_enabled and valid_domain.sum() == 0:
                 continue
 
-            lamb = lambda_schedule(global_iter, max_iter=max_iter, gamma=gamma) if cfg["domain_adv"]["enabled"] else 0.0
+            lamb = lambda_schedule(global_iter, max_iter=max_iter, gamma=gamma) if domain_adv_enabled else 0.0
             lamb_last = float(lamb)
 
             opt.zero_grad(set_to_none=True)
@@ -290,7 +326,10 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
                         yb_train, pred, quantiles, use_huber=use_huber, delta=delta, sample_weight=sw
                     )
 
-                dom_loss = domain_ce_loss(dom_logits[valid_domain], db[valid_domain])
+                if domain_adv_enabled:
+                    dom_loss = domain_ce_loss(dom_logits[valid_domain], db[valid_domain])
+                else:
+                    dom_loss = torch.zeros((), device=device)
                 loss = task_loss + beta * dom_loss
 
             scaler_amp.scale(loss).backward()
