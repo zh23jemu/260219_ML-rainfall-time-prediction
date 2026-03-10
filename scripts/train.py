@@ -121,6 +121,60 @@ def rain_sample_weight(y_raw: torch.Tensor, task_cfg: dict):
         w = torch.where(y_raw >= t, torch.full_like(w, wt), w)
     return w
 
+def rain_band_metrics(y_true: np.ndarray, y_pred: np.ndarray, thresholds):
+    stats = {}
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    for thr in thresholds:
+        mask = y_true >= float(thr)
+        key = f"ge_{int(thr) if float(thr).is_integer() else thr}mm"
+        if not np.any(mask):
+            stats[key] = {"count": 0, "rmse": None, "mae": None}
+            continue
+        stats[key] = {
+            "count": int(mask.sum()),
+            "rmse": rmse(y_true[mask], y_pred[mask]),
+            "mae": mae(y_true[mask], y_pred[mask]),
+        }
+    return stats
+
+def summarize_predictions(y_true: np.ndarray, y_pred: np.ndarray, task_mode: str, lo=None, hi=None, quantiles=None):
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    thresholds = [10.0, 25.0, 50.0]
+    metrics = {
+        "rmse": rmse(y_true, y_pred),
+        "mae": mae(y_true, y_pred),
+        "target_mean": float(np.mean(y_true)),
+        "pred_mean": float(np.mean(y_pred)),
+        "bias_mean": float(np.mean(y_pred - y_true)),
+        "rain_bands": rain_band_metrics(y_true, y_pred, thresholds),
+    }
+
+    if task_mode != "point":
+        lo = np.asarray(lo).reshape(-1)
+        hi = np.asarray(hi).reshape(-1)
+        q = list(quantiles)
+        alpha = 1 - (q[-1] - q[0])
+        metrics.update({
+            "picp": picp(y_true, lo, hi),
+            "pinaw": pinaw(lo, hi, y_true),
+            "aql": aql(y_true, lo, hi, alpha=alpha),
+        })
+        for thr in thresholds:
+            mask = y_true >= float(thr)
+            key = f"ge_{int(thr) if float(thr).is_integer() else thr}mm"
+            band = metrics["rain_bands"][key]
+            if not np.any(mask):
+                band.update({"picp": None, "pinaw": None, "aql": None})
+                continue
+            band.update({
+                "picp": picp(y_true[mask], lo[mask], hi[mask]),
+                "pinaw": pinaw(lo[mask], hi[mask], y_true[mask]),
+                "aql": aql(y_true[mask], lo[mask], hi[mask], alpha=alpha),
+            })
+    return metrics
+
 def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resume_path: str | None = None):
     L = int(cfg["lookback_L"])
     H = int(cfg["horizon_H"])
@@ -192,23 +246,34 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
         domain_all = np.zeros(len(df), dtype=np.int64)
         num_domains = 1
 
+    def get_target_dates(mask):
+        dates = pd.to_datetime(df.loc[mask, "date"]).reset_index(drop=True)
+        target_dates = []
+        for idx in range(len(dates) - H - (L - 1)):
+            t = idx + (L - 1)
+            horizon_dates = dates.iloc[t + 1 : t + 1 + H].tolist()
+            target_dates.append(horizon_dates)
+        return target_dates
+
     # 构造 Dataset（注意：domain 取 t 对应标签；t<L-1 或 t>T-H 为 -1）
     def make_loader(mask, shuffle):
         X = X_all_z[mask]
         y = y_all[mask]
         d = domain_all[mask]
         ds = SlidingWindowDataset(X, y, d, L=L, H=H)
-        return DataLoader(
+        loader = DataLoader(
             ds,
             batch_size=cfg["train"]["batch_size"],
             shuffle=shuffle,
             num_workers=cfg["train"]["num_workers"],
             drop_last=shuffle,
         )
+        target_dates = get_target_dates(mask)
+        return loader, target_dates
 
-    tr_loader = make_loader(train_mask, shuffle=True)
-    va_loader = make_loader(val_mask, shuffle=False)
-    te_loader = make_loader(test_mask, shuffle=False)
+    tr_loader, _ = make_loader(train_mask, shuffle=True)
+    va_loader, _ = make_loader(val_mask, shuffle=False)
+    te_loader, te_target_dates = make_loader(test_mask, shuffle=False)
 
     # 模型
     task_mode = cfg["task"]["mode"]
@@ -400,7 +465,16 @@ def run_one_target(cfg, df, target_city: str, device: str, target_dir: str, resu
     if best_state is None:
         best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
-    test_metrics, pred_df = test_and_dump(model, te_loader, device, task_mode, quantiles, target_city, task_cfg)
+    test_metrics, pred_df = test_and_dump(
+        model,
+        te_loader,
+        te_target_dates,
+        device,
+        task_mode,
+        quantiles,
+        target_city,
+        task_cfg,
+    )
     history_df = pd.DataFrame(history_rows)
 
     return {
@@ -432,7 +506,7 @@ def evaluate(model, loader, device, task_mode, quantiles, task_cfg):
     return rmse(y, p)
 
 @torch.no_grad()
-def test_and_dump(model, loader, device, task_mode, quantiles, target_city, task_cfg):
+def test_and_dump(model, loader, target_dates, device, task_mode, quantiles, target_city, task_cfg):
     model.eval()
     ys, p50s, los, his = [], [], [], []
     for xb, yb, db in loader:
@@ -461,27 +535,30 @@ def test_and_dump(model, loader, device, task_mode, quantiles, target_city, task
     y = np.concatenate(ys, axis=0)      # [N,H]
     p50 = np.concatenate(p50s, axis=0)  # [N,H]
 
-    metrics = {
-        "rmse": rmse(y.reshape(-1), p50.reshape(-1)),
-        "mae": mae(y.reshape(-1), p50.reshape(-1)),
-    }
-
     if task_mode != "point":
         lo = np.concatenate(los, axis=0)
         hi = np.concatenate(his, axis=0)
-        metrics.update({
-            "picp": picp(y.reshape(-1), lo.reshape(-1), hi.reshape(-1)),
-            "pinaw": pinaw(lo.reshape(-1), hi.reshape(-1), y.reshape(-1)),
-            "aql": aql(y.reshape(-1), lo.reshape(-1), hi.reshape(-1), alpha=1- (quantiles[-1]-quantiles[0])),
-        })
+        metrics = summarize_predictions(
+            y.reshape(-1), p50.reshape(-1), task_mode, lo=lo.reshape(-1), hi=hi.reshape(-1), quantiles=quantiles
+        )
+    else:
+        metrics = summarize_predictions(y.reshape(-1), p50.reshape(-1), task_mode)
 
     # dump csv
     rows = []
     for i in range(y.shape[0]):
         for h in range(y.shape[1]):
-            row = {"sample": i, "horizon": h+1, "y_true": float(y[i,h]), "y_pred": float(p50[i,h]), "target_city": target_city}
+            row = {
+                "sample": i,
+                "horizon": h + 1,
+                "target_city": target_city,
+                "target_date": pd.Timestamp(target_dates[i][h]).strftime("%Y-%m-%d") if i < len(target_dates) and h < len(target_dates[i]) else None,
+                "y_true": float(y[i, h]),
+                "y_pred": float(p50[i, h]),
+            }
             if task_mode != "point":
-                row["y_lo"] = float(lo[i,h]); row["y_hi"] = float(hi[i,h])
+                row["y_lo"] = float(lo[i, h])
+                row["y_hi"] = float(hi[i, h])
             rows.append(row)
     pred_df = pd.DataFrame(rows)
     return metrics, pred_df
