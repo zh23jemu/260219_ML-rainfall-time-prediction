@@ -1,0 +1,111 @@
+import argparse
+import os
+
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+import pandas as pd
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Plot merged point and interval predictions by city.")
+    parser.add_argument(
+        "--merged_csv",
+        type=str,
+        default="runs/gz_rain_allcities_final_predictions_merged.csv",
+        help="Path to merged prediction csv.",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="runs/gz_rain_allcities_final_figures",
+        help="Directory for output figures.",
+    )
+    parser.add_argument("--horizon", type=int, default=1, help="Forecast horizon to plot (1-based).")
+    parser.add_argument("--tail_points", type=int, default=300, help="Tail points for each city plot.")
+    parser.add_argument("--max_cities", type=int, default=None, help="Optional maximum number of cities to plot.")
+    return parser.parse_args()
+
+
+def configure_matplotlib_for_chinese():
+    preferred_fonts = [
+        "Noto Sans CJK SC",
+        "Source Han Sans CN",
+        "Microsoft YaHei",
+        "SimHei",
+        "WenQuanYi Zen Hei",
+        "PingFang SC",
+    ]
+    installed = {f.name for f in font_manager.fontManager.ttflist}
+    chosen = next((name for name in preferred_fonts if name in installed), None)
+    if chosen:
+        plt.rcParams["font.sans-serif"] = [chosen]
+        plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+def plot_one_city(df_city: pd.DataFrame, city: str, out_path: str):
+    fig, ax = plt.subplots(figsize=(12, 5))
+    x = range(len(df_city))
+
+    ax.plot(x, df_city["y_true"].values, label="True", linewidth=1.8, color="black")
+    ax.plot(x, df_city["point_pred"].values, label="Point Model", linewidth=1.5, color="tab:blue")
+    ax.plot(
+        x,
+        df_city["interval_p50"].values,
+        label="Interval Median",
+        linewidth=1.4,
+        color="tab:orange",
+        linestyle="--",
+    )
+    ax.fill_between(
+        x,
+        df_city["y_lo"].values,
+        df_city["y_hi"].values,
+        alpha=0.2,
+        color="tab:orange",
+        label="Prediction Interval",
+    )
+
+    ax.set_title(f"{city} - Point and Interval Forecast")
+    ax.set_xlabel("Sample")
+    ax.set_ylabel("Rainfall")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def main():
+    args = parse_args()
+    configure_matplotlib_for_chinese()
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    df = pd.read_csv(args.merged_csv)
+    required_cols = {
+        "target_city", "target_date", "horizon", "y_true",
+        "point_pred", "interval_p50", "y_lo", "y_hi",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    horizon_df = df[df["horizon"] == int(args.horizon)].copy()
+    cities = sorted(horizon_df["target_city"].unique())
+    if args.max_cities is not None:
+        cities = cities[: args.max_cities]
+
+    for city in cities:
+        cdf = horizon_df[horizon_df["target_city"] == city].copy()
+        if "target_date" in cdf.columns:
+            cdf = cdf.sort_values("target_date")
+        if args.tail_points is not None and args.tail_points > 0:
+            cdf = cdf.tail(int(args.tail_points))
+        out_name = f"{city}_h{args.horizon}_merged_forecast.png"
+        out_path = os.path.join(args.out_dir, out_name)
+        plot_one_city(cdf.reset_index(drop=True), city, out_path)
+        print(f"saved: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
