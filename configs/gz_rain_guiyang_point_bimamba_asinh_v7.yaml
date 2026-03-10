@@ -1,0 +1,66 @@
+exp_name: gz_rain_guiyang_point_bimamba_asinh_v7
+data_path: 20152024.xlsx
+
+target_city: "贵阳市"
+
+lookback_L: 60
+horizon_H: 1
+use_time_features: true
+feature_mode: "all"
+neighbor_mode: "all"
+topk: 0
+
+split:
+  train_years: [2015,2016,2017,2018,2019,2020,2021,2022]
+  val_years: [2023]
+  test_years: [2024]
+
+gmm:
+  k_min: 2
+  k_max: 4
+  random_state: 42
+
+model:
+  name: "simple_bimamba"
+  d_model: 128
+  conbimamba_layers: 2
+  dropout: 0.1
+  require_mamba: true
+
+train:
+  seed: 42
+  batch_size: 64
+  num_workers: 0
+  lr: 0.00035
+  weight_decay: 0.0001
+  epochs: 70
+  grad_clip: 1.0
+  use_amp: true
+  amp_dtype: "fp16"
+  scheduler:
+    type: "cosine"
+    t_max: 70
+    eta_min: 0.000015
+  early_stopping:
+    enabled: true
+    patience: 14
+    min_delta: 0.0
+
+domain_adv:
+  enabled: false
+  beta: 0.0
+  grl_gamma: 10.0
+  max_iter: 20000
+  domain_hidden: 64
+
+task:
+  mode: "point"
+  quantiles: [0.05, 0.5, 0.95]
+  use_huber_pinball: false
+  huber_delta: 1.0
+  target_transform: "asinh"
+  asinh_scale: 10.0
+  rain_weighting:
+    enabled: true
+    thresholds: [0.1, 10.0, 25.0, 50.0]
+    weights: [1.0, 1.6, 3.8, 6.5, 10.0]
